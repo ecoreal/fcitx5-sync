@@ -4,6 +4,7 @@
 //! → watcher/transport（文件监听与同步通道）。全部不依赖 Tauri，可独立测试。
 
 pub mod container;
+pub mod dict;
 pub mod history;
 
 #[cfg(test)]
