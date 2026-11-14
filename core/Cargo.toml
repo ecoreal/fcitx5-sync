@@ -1,0 +1,12 @@
+[package]
+name = "fcitx5-sync-core"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust core for fcitx5 user data sync: container parsing, dict merge, transports"
+
+[dependencies]
+zstd = "0.13"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
