@@ -9,7 +9,9 @@ use fcitx5_sync_core::pipeline::{self, PullReport, PushReport, SyncJob};
 use serde::Serialize;
 use settings::Settings;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::{
     menu::{MenuBuilder, MenuItem},
     tray::TrayIconBuilder,
@@ -24,6 +26,10 @@ struct AppState {
     settings: Mutex<Settings>,
     last_push: Mutex<Option<String>>,
     last_pull: Mutex<Option<String>>,
+    /// 串行化同步核心：自动调度与手动触发可能并发，避免同时写本机文件
+    sync_lock: Mutex<()>,
+    /// 是否已有自动同步调度线程存活（防止重复启动）
+    auto_sync_running: AtomicBool,
 }
 
 #[derive(Clone, Serialize)]
@@ -62,9 +68,11 @@ fn build_job(app: &tauri::AppHandle, workdir: &TempDir) -> Result<SyncJob, Strin
     })
 }
 
-/// 执行推送/拉取并更新状态 + 通知。
-fn run_sync(app: &tauri::AppHandle, kind: &str) -> Result<String, String> {
+/// 执行推送/拉取并更新状态；不发事件、不弹通知，由调用方决定。
+/// 手动路径与自动调度共用；`sync_lock` 保证同一时刻只有一轮在写本机文件。
+fn run_sync_inner(app: &tauri::AppHandle, kind: &str) -> Result<String, String> {
     let state = app.state::<AppState>();
+    let _syncing = state.sync_lock.lock().unwrap();
     let remote_dir = {
         let s = state.settings.lock().unwrap().clone();
         s.remote_dir
@@ -102,9 +110,19 @@ fn run_sync(app: &tauri::AppHandle, kind: &str) -> Result<String, String> {
         }
         _ => return Err("unknown sync kind".into()),
     };
+    Ok(summary)
+}
 
+/// 手动推送/拉取入口（托盘菜单 / 面板按钮）：执行后发 `sync-done` 事件并按设置弹通知。
+fn run_sync(app: &tauri::AppHandle, kind: &str) -> Result<String, String> {
+    let summary = run_sync_inner(app, kind)?;
     let _ = app.emit("sync-done", kind);
-    let notify = state.settings.lock().unwrap().notify_on_sync;
+    let notify = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .notify_on_sync;
     if notify {
         app.notification()
             .builder()
@@ -114,6 +132,93 @@ fn run_sync(app: &tauri::AppHandle, kind: &str) -> Result<String, String> {
             .ok();
     }
     Ok(summary)
+}
+
+/// 一轮双向同步（自动调度专用入口）：先 pull（远端合并写回本机，含备份与重载），
+/// 再把超集 push 回远端。整轮只发一次 `sync-done`、按设置只弹一次通知；
+/// 未配置同步目录、或本机与远端都还没有词库数据时静默跳过本轮。
+/// pull 失败则本轮中止（下一轮重试）；错误通过 `sync-error` 事件上报前端。
+fn sync_bidirectional(app: &tauri::AppHandle) -> Result<String, String> {
+    let (remote_dir, notify) = {
+        let s = app.state::<AppState>().settings.lock().unwrap().clone();
+        (s.remote_dir, s.notify_on_sync)
+    };
+    if remote_dir.is_empty() {
+        return Ok(String::new()); // 未配置同步目录：本轮静默跳过
+    }
+    let data_dir = settings::fcitx5_data_dir();
+    let remote = PathBuf::from(&remote_dir);
+    let has_local = data_dir.join("user.dict").exists() || data_dir.join("user.history").exists();
+    let has_remote = remote.join("user.dict").exists() || remote.join("user.history").exists();
+    if !has_local && !has_remote {
+        return Ok(String::new()); // 两边都无数据：无事可同步，静默跳过
+    }
+
+    let pull_summary = run_sync_inner(app, "pull")?;
+    let push_summary = run_sync_inner(app, "push")?;
+    let summary = format!("自动同步：{pull_summary}；{push_summary}");
+    let _ = app.emit("sync-done", "auto");
+    if notify {
+        app.notification()
+            .builder()
+            .title("Fcitx5 Sync")
+            .body(&summary)
+            .show()
+            .ok();
+    }
+    Ok(summary)
+}
+
+/// 自动同步调度：确保有一个后台线程按 `auto_sync_interval_min` 分钟执行一轮双向同步。
+/// interval 为 0（关闭）时不启动；已有调度线程存活时也不重复启动
+/// （存活线程每秒重读设置，会自行适应变更）。
+fn spawn_auto_sync(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    if state.settings.lock().unwrap().auto_sync_interval_min == 0 {
+        return; // 关闭状态：不启动线程
+    }
+    if state.auto_sync_running.swap(true, Ordering::SeqCst) {
+        return; // 已有调度线程在跑
+    }
+    let handle = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("auto-sync".into())
+        .spawn(move || auto_sync_loop(handle));
+    if spawned.is_err() {
+        // 线程没起出来：归还「无调度线程」状态，下次设置变更可重试
+        state.auto_sync_running.store(false, Ordering::SeqCst);
+        eprintln!("启动自动同步线程失败: {:?}", spawned.err());
+    }
+}
+
+/// 调度循环：每秒重读设置——interval 从 >0 改为 0 时当秒退出；间隔变更即时
+/// 影响下一轮时刻；目录、通知开关等设置变更均在下一轮生效。
+fn auto_sync_loop(app: tauri::AppHandle) {
+    // 把线程启动时刻视为「上一轮结束」：首轮在启动后 interval 分钟执行
+    let mut last_round = Instant::now();
+    loop {
+        let interval_min = app
+            .state::<AppState>()
+            .settings
+            .lock()
+            .unwrap()
+            .auto_sync_interval_min;
+        if interval_min == 0 {
+            break; // 设置改为 0：线程退出，不再有下一轮
+        }
+        let due = last_round + Duration::from_secs(u64::from(interval_min) * 60);
+        if Instant::now() >= due {
+            if let Err(e) = sync_bidirectional(&app) {
+                let _ = app.emit("sync-error", e);
+            }
+            last_round = Instant::now();
+        } else {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    app.state::<AppState>()
+        .auto_sync_running
+        .store(false, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -162,6 +267,9 @@ fn set_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String>
     let path = state.settings_path.clone();
     settings.save(&path)?;
     *state.settings.lock().unwrap() = settings;
+    // 从关闭改为开启（或已是开启但无线程）时补启调度线程；
+    // 已有线程存活时由它自行重读设置，下一轮生效
+    spawn_auto_sync(&app);
     Ok(())
 }
 
@@ -182,7 +290,12 @@ pub fn run() {
                 settings: Mutex::new(initial),
                 last_push: Mutex::new(None),
                 last_pull: Mutex::new(None),
+                sync_lock: Mutex::new(()),
+                auto_sync_running: AtomicBool::new(false),
             });
+
+            // 自动同步调度：interval > 0 时启动后台线程；每轮重读设置，改 0 即退出
+            spawn_auto_sync(app.handle());
 
             // 托盘菜单
             let push = MenuItem::with_id(app, "push", "立即推送（本机 → 同步目录）", true, None::<&str>)?;

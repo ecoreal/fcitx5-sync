@@ -1,3 +1,12 @@
 [workspace]
 members = ["core", "src-tauri"]
 resolver = "2"
+
+# Read more about release optimization: https://tauri.app/concept/size/#cargo-configuration
+# 注意：profile 必须放在 workspace 根（src-tauri 不是根，放那里会被忽略）
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

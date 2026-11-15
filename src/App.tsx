@@ -33,6 +33,7 @@ interface Settings {
 function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [remoteDir, setRemoteDir] = useState("");
+  const [intervalMin, setIntervalMin] = useState(0);
   const [busy, setBusy] = useState<"push" | "pull" | null>(null);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(
     null,
@@ -42,6 +43,7 @@ function App() {
     const s: Status = await invoke("get_status");
     setStatus(s);
     setRemoteDir(s.remote_dir);
+    setIntervalMin(s.auto_sync_interval_min);
   }, []);
 
   useEffect(() => {
@@ -75,7 +77,7 @@ function App() {
   async function saveSettings() {
     const settings: Settings = {
       remote_dir: remoteDir.trim(),
-      auto_sync_interval_min: status?.auto_sync_interval_min ?? 0,
+      auto_sync_interval_min: intervalMin,
       notify_on_sync: status?.notify_on_sync ?? true,
     };
     try {
@@ -157,6 +159,18 @@ function App() {
             value={remoteDir}
             onChange={(e) => setRemoteDir(e.target.value)}
           />
+          <label className="flex items-center justify-between gap-3 text-sm">
+            自动同步间隔（分钟，0 = 关闭）
+            <Input
+              type="number"
+              min={0}
+              className="w-28"
+              value={intervalMin}
+              onChange={(e) =>
+                setIntervalMin(Math.max(0, Math.floor(Number(e.target.value) || 0)))
+              }
+            />
+          </label>
           <Button variant="secondary" onClick={() => void saveSettings()}>
             保存设置
           </Button>

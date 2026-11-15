@@ -89,7 +89,7 @@ fn fmt_freq(f: f32) -> String {
 /// 合并：按 (word, pinyin) 并集；两边都有的词频取 max；
 /// base 顺序优先，newer 独有词条按 newer 顺序追加。
 pub fn merge(base: &[DictEntry], newer: &[DictEntry]) -> Vec<DictEntry> {
-    let mut key = |e: &DictEntry| (e.word.clone(), e.pinyin.clone());
+    let key = |e: &DictEntry| (e.word.clone(), e.pinyin.clone());
     let mut result: Vec<DictEntry> = Vec::with_capacity(base.len() + newer.len());
     let mut newer_map: std::collections::HashMap<(String, String), f32> =
         std::collections::HashMap::with_capacity(newer.len());
