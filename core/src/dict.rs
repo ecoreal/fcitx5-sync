@@ -121,6 +121,11 @@ pub fn merge(base: &[DictEntry], newer: &[DictEntry]) -> Vec<DictEntry> {
     result
 }
 
+/// 定位 `libime_pinyindict`；找不到返回 None（管线据此降级/报错）。
+pub fn resolve_tool_path() -> Option<PathBuf> {
+    resolve_tool().ok()
+}
+
 fn resolve_tool() -> Result<PathBuf, DictError> {
     if let Ok(p) = std::env::var("LIBIME_PINYINDICT") {
         let path = PathBuf::from(p);

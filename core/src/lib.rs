@@ -5,7 +5,12 @@
 
 pub mod container;
 pub mod dict;
+pub mod engine;
+pub mod fingerprint;
 pub mod history;
+pub mod pipeline;
+pub mod reload;
+pub mod transport;
 
 #[cfg(test)]
 mod tests {
